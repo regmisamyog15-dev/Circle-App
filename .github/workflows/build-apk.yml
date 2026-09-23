@@ -8,6 +8,10 @@ on:
     branches:
       - main
 
+env:
+  # Fixed path — no dynamic env var needed
+  PROJECT_DIR: ${{ github.workspace }}/build_src/quickcircle_done
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -26,11 +30,10 @@ jobs:
       - name: Extract quickcircle_final.zip
         run: |
           set -e
-          unzip -q quickcircle_final.zip -d "$GITHUB_WORKSPACE/build_src"
-          PROJECT_DIR=$(find "$GITHUB_WORKSPACE/build_src" -name "gradlew" -maxdepth 3 | head -1 | xargs dirname)
-          echo "Project root: $PROJECT_DIR"
-          ls "$PROJECT_DIR"
-          echo "PROJECT_DIR=$PROJECT_DIR" >> $GITHUB_ENV
+          unzip -q quickcircle_final.zip -d "${{ github.workspace }}/build_src"
+          echo "Extracted:"
+          ls "${{ github.workspace }}/build_src/"
+          ls "${{ env.PROJECT_DIR }}/"
 
       - name: Cache Gradle
         uses: actions/cache@v4
@@ -61,22 +64,24 @@ jobs:
 
       - name: Verify Gradle wrapper JAR
         run: |
-          JAR="$PROJECT_DIR/gradle/wrapper/gradle-wrapper.jar"
+          JAR="${{ env.PROJECT_DIR }}/gradle/wrapper/gradle-wrapper.jar"
           if [ -f "$JAR" ] && [ -s "$JAR" ]; then
             echo "✅ gradle-wrapper.jar OK ($(du -h "$JAR" | cut -f1))"
           else
             echo "Bootstrapping wrapper..."
-            GRADLE_VER=$(grep distributionUrl "$PROJECT_DIR/gradle/wrapper/gradle-wrapper.properties" \
+            GRADLE_VER=$(grep distributionUrl "${{ env.PROJECT_DIR }}/gradle/wrapper/gradle-wrapper.properties" \
               | grep -oP 'gradle-\K[0-9.]+')
             wget -q "https://services.gradle.org/distributions/gradle-${GRADLE_VER}-bin.zip" -O /tmp/g.zip
             unzip -q /tmp/g.zip -d /tmp/gi
-            /tmp/gi/gradle-${GRADLE_VER}/bin/gradle -p "$PROJECT_DIR" wrapper \
+            /tmp/gi/gradle-${GRADLE_VER}/bin/gradle \
+              -p "${{ env.PROJECT_DIR }}" wrapper \
               --gradle-version "$GRADLE_VER" --distribution-type bin
           fi
+          ls -lh "${{ env.PROJECT_DIR }}/gradle/wrapper/"
 
       - name: Create debug keystore
         run: |
-          KEYSTORE="$PROJECT_DIR/debug.keystore"
+          KEYSTORE="${{ env.PROJECT_DIR }}/debug.keystore"
           keytool -genkeypair \
             -keystore "$KEYSTORE" \
             -alias androiddebugkey \
@@ -84,39 +89,41 @@ jobs:
             -storepass android -keypass android \
             -dname "CN=Android Debug,O=Android,C=US" \
             -storetype JKS 2>/dev/null
-          echo "✅ Keystore created"
+          echo "✅ Keystore: $(ls -lh "$KEYSTORE")"
 
       - name: Make gradlew executable
-        run: chmod +x "$PROJECT_DIR/gradlew"
+        run: chmod +x "${{ env.PROJECT_DIR }}/gradlew"
 
-      # pipefail ensures Gradle's exit code propagates through tee
       - name: Build debug APK
-        shell: bash
+        working-directory: ${{ env.PROJECT_DIR }}
         run: |
-          set -euo pipefail
           echo "Java:         $(java -version 2>&1 | head -1)"
           echo "ANDROID_HOME: $ANDROID_HOME"
-          echo "Project:      $PROJECT_DIR"
-          cd "$PROJECT_DIR"
+          echo "Working dir:  $(pwd)"
           ./gradlew assembleDebug \
             --no-daemon \
             --stacktrace \
-            -Dorg.gradle.jvmargs="-Xmx4g -XX:+HeapDumpOnOutOfMemoryError" \
-            2>&1 | tee "$GITHUB_WORKSPACE/build_output.txt"
-          echo "✅ Gradle exited 0"
+            2>&1 | tee "${{ github.workspace }}/build_output.txt"
+          # Check Gradle exit code explicitly (tee masks it otherwise)
+          GRADLE_EXIT=${PIPESTATUS[0]}
+          if [ "$GRADLE_EXIT" != "0" ]; then
+            echo "❌ Gradle exited with code $GRADLE_EXIT"
+            exit $GRADLE_EXIT
+          fi
+          echo "✅ Gradle build succeeded"
 
       - name: Find and verify APK
         run: |
-          set -e
-          echo "=== Searching for APK files ==="
-          find "$GITHUB_WORKSPACE" -name "*.apk" 2>/dev/null && echo "---" || echo "none in GITHUB_WORKSPACE"
+          echo "=== APK search ==="
+          find "${{ github.workspace }}" -name "*.apk" 2>/dev/null || true
 
-          APK_PATH=$(find "$GITHUB_WORKSPACE" -path "*/apk/debug/*.apk" 2>/dev/null | head -1)
-          [ -z "$APK_PATH" ] && APK_PATH=$(find "$GITHUB_WORKSPACE" -name "*debug*.apk" 2>/dev/null | head -1)
-          [ -z "$APK_PATH" ] && APK_PATH=$(find "$GITHUB_WORKSPACE" -name "*.apk" 2>/dev/null | head -1)
+          APK_PATH=$(find "${{ github.workspace }}" -path "*/apk/debug/*.apk" | head -1)
+          [ -z "$APK_PATH" ] && APK_PATH=$(find "${{ github.workspace }}" -name "*debug*.apk" | head -1)
+          [ -z "$APK_PATH" ] && APK_PATH=$(find "${{ github.workspace }}" -name "*.apk" | head -1)
 
           if [ -z "$APK_PATH" ]; then
-            echo "❌ APK not found"
+            echo "❌ No APK found"
+            tail -80 "${{ github.workspace }}/build_output.txt"
             exit 1
           fi
 
@@ -137,19 +144,26 @@ jobs:
           echo "## ✅ QuickCircle Debug APK Built" >> $GITHUB_STEP_SUMMARY
           echo "| | |" >> $GITHUB_STEP_SUMMARY
           echo "|---|---|" >> $GITHUB_STEP_SUMMARY
-          echo "| APK | \`$APK_NAME\` |" >> $GITHUB_STEP_SUMMARY
-          echo "| Size | $(du -h "$APK_PATH" | cut -f1) |" >> $GITHUB_STEP_SUMMARY
+          echo "| APK | \`${{ env.APK_NAME }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Size | $(du -h "${{ env.APK_PATH }}" | cut -f1) |" >> $GITHUB_STEP_SUMMARY
           echo "| Artifact | \`QuickCircle-debug-APK\` |" >> $GITHUB_STEP_SUMMARY
-          echo "| Commit | \`$GITHUB_SHA\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Commit | \`${{ github.sha }}\` |" >> $GITHUB_STEP_SUMMARY
+
+      - name: Upload build log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: ${{ github.workspace }}/build_output.txt
+          retention-days: 7
+          if-no-files-found: ignore
 
       - name: Dump build log on failure
         if: failure()
         run: |
+          echo "=== PROJECT_DIR ==="
+          echo "${{ env.PROJECT_DIR }}"
           echo "=== BUILD LOG (last 150 lines) ==="
-          tail -150 "$GITHUB_WORKSPACE/build_output.txt" 2>/dev/null || echo "(no build log)"
-          echo ""
-          echo "=== PROJECT_DIR contents ==="
-          ls -la "$PROJECT_DIR/" 2>/dev/null || echo "(PROJECT_DIR not accessible)"
-          echo ""
+          tail -150 "${{ github.workspace }}/build_output.txt" 2>/dev/null || echo "(no log)"
           echo "=== app/build dir ==="
-          find "$PROJECT_DIR/app/build" -maxdepth 4 2>/dev/null | head -40 || echo "(no build dir)"
+          find "${{ env.PROJECT_DIR }}/app/build" -maxdepth 5 2>/dev/null | head -40 || echo "(no build dir)"
