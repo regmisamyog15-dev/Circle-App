@@ -14,28 +14,25 @@ jobs:
     timeout-minutes: 45
 
     steps:
-      # ── 1. Checkout ──────────────────────────────────────────────────────────
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # ── 2. Java 21 — no Gradle cache here (project is inside ZIP) ────────────
       - name: Set up Java 21
         uses: actions/setup-java@v4
         with:
           java-version: '21'
           distribution: 'temurin'
 
-      # ── 3. Extract ZIP first so we can inspect Gradle files ──────────────────
+      # Extract ZIP before any caching so Gradle files exist
       - name: Extract quickcircle_final.zip
         run: |
           set -e
-          unzip -q quickcircle_final.zip -d build_src
-          PROJECT_DIR=$(find build_src -name "gradlew" -maxdepth 3 | head -1 | xargs dirname)
-          echo "Android project root: $PROJECT_DIR"
-          echo "PROJECT_DIR=$PROJECT_DIR" >> $GITHUB_ENV
+          unzip -q quickcircle_final.zip -d "$GITHUB_WORKSPACE/build_src"
+          PROJECT_DIR=$(find "$GITHUB_WORKSPACE/build_src" -name "gradlew" -maxdepth 3 | head -1 | xargs dirname)
+          echo "Found project root: $PROJECT_DIR"
           ls "$PROJECT_DIR"
+          echo "PROJECT_DIR=$PROJECT_DIR" >> $GITHUB_ENV
 
-      # ── 4. Gradle wrapper cache (now that files exist) ────────────────────────
       - name: Cache Gradle
         uses: actions/cache@v4
         with:
@@ -45,109 +42,88 @@ jobs:
           key: gradle-${{ runner.os }}-${{ hashFiles('build_src/**/gradle-wrapper.properties', 'build_src/**/libs.versions.toml') }}
           restore-keys: gradle-${{ runner.os }}-
 
-      # ── 5. Android SDK ───────────────────────────────────────────────────────
-      - name: Install Android SDK (cmdline-tools + platform-36 + build-tools-35)
+      - name: Install Android SDK
         run: |
           set -e
           ANDROID_HOME_DIR="$HOME/android-sdk"
           mkdir -p "$ANDROID_HOME_DIR/cmdline-tools"
-
-          echo "Downloading Android cmdline-tools 11.0..."
           wget -q "https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip" \
             -O /tmp/cmdline-tools.zip
           unzip -q /tmp/cmdline-tools.zip -d /tmp/cmdline-tools-raw
           mv /tmp/cmdline-tools-raw/cmdline-tools "$ANDROID_HOME_DIR/cmdline-tools/latest"
-
           export ANDROID_HOME="$ANDROID_HOME_DIR"
-          export ANDROID_SDK_ROOT="$ANDROID_HOME_DIR"
-          export PATH="$ANDROID_HOME/cmdline-tools/latest/bin:$ANDROID_HOME/platform-tools:$PATH"
-
+          export PATH="$ANDROID_HOME/cmdline-tools/latest/bin:$PATH"
           yes | sdkmanager --licenses > /dev/null 2>&1 || true
-
-          sdkmanager \
-            "platforms;android-36" \
-            "platforms;android-35" \
-            "build-tools;35.0.0" \
-            "platform-tools"
-
+          sdkmanager "platforms;android-36" "platforms;android-35" "build-tools;35.0.0" "platform-tools"
           echo "ANDROID_HOME=$ANDROID_HOME_DIR" >> $GITHUB_ENV
           echo "ANDROID_SDK_ROOT=$ANDROID_HOME_DIR" >> $GITHUB_ENV
           echo "$ANDROID_HOME_DIR/cmdline-tools/latest/bin" >> $GITHUB_PATH
           echo "$ANDROID_HOME_DIR/platform-tools" >> $GITHUB_PATH
 
-          echo "Installed components:"
-          sdkmanager --list_installed 2>/dev/null | head -15 || true
-
-      # ── 6. Ensure gradle-wrapper.jar ─────────────────────────────────────────
       - name: Verify Gradle wrapper JAR
         run: |
           JAR="$PROJECT_DIR/gradle/wrapper/gradle-wrapper.jar"
           if [ -f "$JAR" ] && [ -s "$JAR" ]; then
-            echo "✅ gradle-wrapper.jar present ($(du -h "$JAR" | cut -f1))"
+            echo "✅ gradle-wrapper.jar OK ($(du -h "$JAR" | cut -f1))"
           else
-            echo "⚠️  JAR missing — bootstrapping with system Gradle..."
-            GRADLE_VERSION=$(grep distributionUrl "$PROJECT_DIR/gradle/wrapper/gradle-wrapper.properties" \
+            echo "Bootstrapping wrapper..."
+            GRADLE_VER=$(grep distributionUrl "$PROJECT_DIR/gradle/wrapper/gradle-wrapper.properties" \
               | grep -oP 'gradle-\K[0-9.]+')
-            echo "Gradle version from wrapper: $GRADLE_VERSION"
-            wget -q "https://services.gradle.org/distributions/gradle-${GRADLE_VERSION}-bin.zip" \
-              -O /tmp/gradle.zip
-            unzip -q /tmp/gradle.zip -d /tmp/gradle_install
-            /tmp/gradle_install/gradle-${GRADLE_VERSION}/bin/gradle \
-              -p "$PROJECT_DIR" wrapper \
-              --gradle-version "$GRADLE_VERSION" \
-              --distribution-type bin
-            echo "✅ Wrapper regenerated"
+            wget -q "https://services.gradle.org/distributions/gradle-${GRADLE_VER}-bin.zip" -O /tmp/g.zip
+            unzip -q /tmp/g.zip -d /tmp/gi
+            /tmp/gi/gradle-${GRADLE_VER}/bin/gradle -p "$PROJECT_DIR" wrapper \
+              --gradle-version "$GRADLE_VER" --distribution-type bin
           fi
           ls -lh "$PROJECT_DIR/gradle/wrapper/"
 
-      # ── 7. Create debug.keystore ─────────────────────────────────────────────
       - name: Create debug keystore
         run: |
           KEYSTORE="$PROJECT_DIR/debug.keystore"
           keytool -genkeypair \
             -keystore "$KEYSTORE" \
             -alias androiddebugkey \
-            -keyalg RSA \
-            -keysize 2048 \
-            -validity 10000 \
-            -storepass android \
-            -keypass android \
+            -keyalg RSA -keysize 2048 -validity 10000 \
+            -storepass android -keypass android \
             -dname "CN=Android Debug,O=Android,C=US" \
             -storetype JKS 2>/dev/null
-          echo "✅ debug.keystore: $(ls -lh "$KEYSTORE")"
+          echo "✅ Keystore: $(ls -lh "$KEYSTORE")"
 
-      # ── 8. Make gradlew executable ───────────────────────────────────────────
       - name: Make gradlew executable
         run: chmod +x "$PROJECT_DIR/gradlew"
 
-      # ── 9. Build debug APK ───────────────────────────────────────────────────
       - name: Build debug APK
-        working-directory: ${{ env.PROJECT_DIR }}
         run: |
           echo "Java:         $(java -version 2>&1 | head -1)"
           echo "ANDROID_HOME: $ANDROID_HOME"
-          echo "Working dir:  $(pwd)"
+          echo "Project:      $PROJECT_DIR"
+          cd "$PROJECT_DIR"
           ./gradlew assembleDebug \
             --no-daemon \
             --stacktrace \
             -Dorg.gradle.jvmargs="-Xmx4g -XX:+HeapDumpOnOutOfMemoryError" \
             2>&1 | tee "$GITHUB_WORKSPACE/build_output.txt"
 
-      # ── 10. Locate and upload APK ─────────────────────────────────────────────
-      - name: Find APK
+      - name: Find and verify APK
         run: |
-          find "$PROJECT_DIR" -name "*.apk" 2>/dev/null || true
-          APK_PATH=$(find "$PROJECT_DIR" -path "*/apk/debug/*.apk" | head -1)
-          [ -z "$APK_PATH" ] && APK_PATH=$(find "$PROJECT_DIR" -name "*debug*.apk" | head -1)
-          [ -z "$APK_PATH" ] && APK_PATH=$(find "$PROJECT_DIR" -name "*.apk" | head -1)
+          echo "=== All APK files in workspace ==="
+          find "$GITHUB_WORKSPACE" -name "*.apk" 2>/dev/null || echo "(none found with workspace search)"
+          find /root -name "*.apk" 2>/dev/null || echo "(none in /root)"
+
+          # Search broadly
+          APK_PATH=$(find "$GITHUB_WORKSPACE" -name "*.apk" 2>/dev/null | grep -i debug | head -1)
+          [ -z "$APK_PATH" ] && APK_PATH=$(find "$GITHUB_WORKSPACE" -name "*.apk" 2>/dev/null | head -1)
+
           if [ -z "$APK_PATH" ]; then
-            echo "❌ No APK found"
-            tail -100 "$GITHUB_WORKSPACE/build_output.txt"
+            echo "❌ APK not found. Build log tail:"
+            tail -80 "$GITHUB_WORKSPACE/build_output.txt"
             exit 1
           fi
-          echo "✅ APK: $APK_PATH ($(du -h "$APK_PATH" | cut -f1))"
+
+          APK_SIZE=$(du -h "$APK_PATH" | cut -f1)
+          APK_NAME=$(basename "$APK_PATH")
+          echo "✅ APK: $APK_PATH ($APK_SIZE)"
           echo "APK_PATH=$APK_PATH" >> $GITHUB_ENV
-          echo "APK_NAME=$(basename "$APK_PATH")" >> $GITHUB_ENV
+          echo "APK_NAME=$APK_NAME" >> $GITHUB_ENV
 
       - name: Upload APK artifact
         uses: actions/upload-artifact@v4
@@ -157,7 +133,6 @@ jobs:
           retention-days: 30
           if-no-files-found: error
 
-      # ── 11. Summary ───────────────────────────────────────────────────────────
       - name: Job summary
         run: |
           echo "## ✅ QuickCircle Debug APK Built" >> $GITHUB_STEP_SUMMARY
@@ -165,12 +140,13 @@ jobs:
           echo "|---|---|" >> $GITHUB_STEP_SUMMARY
           echo "| APK | \`$APK_NAME\` |" >> $GITHUB_STEP_SUMMARY
           echo "| Size | $(du -h "$APK_PATH" | cut -f1) |" >> $GITHUB_STEP_SUMMARY
-          echo "| Artifact | QuickCircle-debug-APK |" >> $GITHUB_STEP_SUMMARY
+          echo "| Artifact | \`QuickCircle-debug-APK\` |" >> $GITHUB_STEP_SUMMARY
           echo "| Commit | \`$GITHUB_SHA\` |" >> $GITHUB_STEP_SUMMARY
 
-      # ── On failure: dump logs ─────────────────────────────────────────────────
       - name: Dump build log on failure
         if: failure()
         run: |
-          echo "=== LAST 120 LINES OF BUILD LOG ==="
-          tail -120 "$GITHUB_WORKSPACE/build_output.txt" 2>/dev/null || echo "(no log yet)"
+          echo "=== BUILD LOG (last 120 lines) ==="
+          tail -120 "$GITHUB_WORKSPACE/build_output.txt" 2>/dev/null || echo "(no build log)"
+          echo "=== APK search (entire runner) ==="
+          find / -name "*.apk" 2>/dev/null | head -20 || echo "none"
